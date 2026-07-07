@@ -1,0 +1,7 @@
+# Passend zu RFEM 6.14 (Server meldet gewuenschte Client-Version 2.14.11).
+# Bei RFEM-Update: dlubal.api auf die vom Server empfohlene Version anheben.
+dlubal.api==2.14.11
+PySide6>=6.7
+PyMuPDF>=1.24
+opencv-python>=4.9
+pytest>=8.0
