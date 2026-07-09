@@ -10,7 +10,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Callable, Optional
 
-from .geometry import GeoArc, GeoPoint, GeoPolyline
+from .geometry import GeoArc, GeoPoint, GeoPolyline, GeoSurface
 from .transform import Point2
 
 if TYPE_CHECKING:
@@ -134,27 +134,67 @@ class AddArcCmd(Command):
             project.model.remove_point(p.id)
 
 
-class DeleteObjectsCmd(Command):
-    """Loescht Punkte, Linien und Boegen inkl. Abhaengigkeits-Abschluss.
+class AddSurfaceCmd(Command):
+    """Fuegt eine Flaeche (Randobjekt-Referenzen) ein."""
 
-    Wird ein Punkt geloescht, der von Linien/Boegen verwendet wird, werden
-    diese mit geloescht (deren dadurch verwaiste Punkte NICHT -
-    freie Punkte bleiben bewusst bestehen, das ist vorhersehbarer).
+    def __init__(self, surface: GeoSurface) -> None:
+        self.surface = surface
+        self.text = "Flaeche fuellen"
+
+    def do(self, project: "Project") -> None:
+        project.model.add_surface(self.surface)
+
+    def undo(self, project: "Project") -> None:
+        project.model.remove_surface(self.surface.id)
+
+
+class SetSurfaceOpeningsCmd(Command):
+    """Aktualisiert die Aussparungen einer vorhandenen Flaeche (z.B. wenn
+    eine ohne Loecher gefuellte Flaeche neu gefuellt wird)."""
+
+    def __init__(self, surface, new_openings: list[list[str]]) -> None:
+        self.surface_id = surface.id
+        self.old = [list(o) for o in surface.opening_ids]
+        self.new = [list(o) for o in new_openings]
+        self.text = "Aussparungen aktualisieren"
+
+    def do(self, project: "Project") -> None:
+        project.model.surfaces[self.surface_id].opening_ids = \
+            [list(o) for o in self.new]
+
+    def undo(self, project: "Project") -> None:
+        project.model.surfaces[self.surface_id].opening_ids = \
+            [list(o) for o in self.old]
+
+
+class DeleteObjectsCmd(Command):
+    """Loescht Punkte, Linien, Boegen und Flaechen inkl. Abhaengigkeits-
+    Abschluss: Punkt weg -> abhaengige Linien/Boegen weg -> abhaengige
+    Flaechen weg. Verwaiste freie Punkte bleiben bewusst bestehen,
+    das ist vorhersehbarer.
     """
 
     def __init__(self, point_ids: set[str], line_ids: set[str],
-                 model, arc_ids: set[str] = frozenset()) -> None:
+                 model, arc_ids: set[str] = frozenset(),
+                 surface_ids: set[str] = frozenset()) -> None:
         line_ids = set(line_ids)
         arc_ids = set(arc_ids)
+        surface_ids = set(surface_ids)
         for pid in point_ids:
             line_ids.update(l.id for l in model.lines_using_point(pid))
             arc_ids.update(a.id for a in model.arcs_using_point(pid))
+        for oid in line_ids | arc_ids:
+            surface_ids.update(s.id for s in model.surfaces_using_object(oid))
+        self.removed_surfaces: list[GeoSurface] = [
+            model.surfaces[sid] for sid in surface_ids]
         self.removed_lines: list[GeoPolyline] = [model.lines[lid] for lid in line_ids]
         self.removed_arcs: list[GeoArc] = [model.arcs[aid] for aid in arc_ids]
         self.removed_points: list[GeoPoint] = [model.points[pid] for pid in point_ids]
         self.text = "Loeschen"
 
     def do(self, project: "Project") -> None:
+        for s in self.removed_surfaces:
+            project.model.remove_surface(s.id)
         for line in self.removed_lines:
             project.model.remove_line(line.id)
         for arc in self.removed_arcs:
@@ -169,6 +209,8 @@ class DeleteObjectsCmd(Command):
             project.model.add_line(line)
         for arc in self.removed_arcs:
             project.model.add_arc(arc)
+        for s in self.removed_surfaces:
+            project.model.add_surface(s)
 
 
 class MovePointCmd(Command):
@@ -183,6 +225,43 @@ class MovePointCmd(Command):
 
     def undo(self, project: "Project") -> None:
         project.model.points[self.point_id].pos = self.old_pos
+
+
+class MergePointsCmd(Command):
+    """Fuehrt zwei Knoten zusammen: alle Linien/Boegen, die den 'victim'
+    referenzieren, zeigen danach auf den 'survivor'; der victim-Punkt wird
+    geloescht. Voraussetzung (vom Aufrufer geprueft): kein Objekt enthaelt
+    beide Knoten (sonst wuerde es degenerieren)."""
+
+    def __init__(self, victim_id: str, survivor_id: str, model) -> None:
+        self.survivor_id = survivor_id
+        self.victim = model.points[victim_id]
+        self.line_snaps = [(l.id, list(l.point_ids))
+                           for l in model.lines.values()
+                           if victim_id in l.point_ids]
+        self.arc_snaps = [(a.id, list(a.point_ids))
+                          for a in model.arcs.values()
+                          if victim_id in a.point_ids]
+        self.text = "Knoten zusammenfuehren"
+
+    def do(self, project: "Project") -> None:
+        m = project.model
+        vid, sid = self.victim.id, self.survivor_id
+        for lid, _ in self.line_snaps:
+            line = m.lines[lid]
+            line.point_ids = [sid if p == vid else p for p in line.point_ids]
+        for aid, _ in self.arc_snaps:
+            arc = m.arcs[aid]
+            arc.point_ids = [sid if p == vid else p for p in arc.point_ids]
+        m.remove_point(vid)
+
+    def undo(self, project: "Project") -> None:
+        m = project.model
+        m.add_point(self.victim)
+        for lid, old in self.line_snaps:
+            m.lines[lid].point_ids = list(old)
+        for aid, old in self.arc_snaps:
+            m.arcs[aid].point_ids = list(old)
 
 
 class SetReferenceCmd(Command):

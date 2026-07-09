@@ -11,7 +11,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-from .geometry import GeoArc, GeometryModel, GeoPoint, GeoPolyline, new_id
+from .geometry import (GeoArc, GeometryModel, GeoPoint, GeoPolyline,
+                       GeoSurface, new_id)
 from .transform import Point2, ViewTransform, Workplane
 
 SCHEMA_VERSION = 1
@@ -77,6 +78,8 @@ class Project:
         # Uebertragungen idempotent (Update statt Duplikat).
         self.rfem_node_map: dict[str, int] = {}
         self.rfem_line_map: dict[str, int] = {}
+        self.rfem_surface_map: dict[str, int] = {}
+        self.rfem_opening_map: dict[str, int] = {}   # key "surfaceid#idx"
         self.active_view_id: Optional[str] = None
         self.file_path: Optional[str] = None
         self.dirty = False
@@ -91,6 +94,11 @@ class Project:
 
     def remove_view(self, view_id: str) -> None:
         """Entfernt Ansicht samt zugehoeriger Objekte und RFEM-Zuordnungen."""
+        for surface in self.model.surfaces_in_view(view_id):
+            self.model.remove_surface(surface.id)
+            self.rfem_surface_map.pop(surface.id, None)
+            for idx in range(len(surface.opening_ids)):
+                self.rfem_opening_map.pop(f"{surface.id}#{idx}", None)
         for line in self.model.lines_in_view(view_id):
             self.model.remove_line(line.id)
             self.rfem_line_map.pop(line.id, None)
@@ -145,8 +153,16 @@ class Project:
                  "control": [a.control.x, a.control.y]}
                 for a in self.model.arcs.values()
             ],
+            "surfaces": [
+                {"id": s.id, "view_id": s.view_id,
+                 "boundary_ids": s.boundary_ids,
+                 "opening_ids": s.opening_ids}
+                for s in self.model.surfaces.values()
+            ],
             "rfem_node_map": self.rfem_node_map,
             "rfem_line_map": self.rfem_line_map,
+            "rfem_surface_map": self.rfem_surface_map,
+            "rfem_opening_map": self.rfem_opening_map,
         }
 
     @classmethod
@@ -176,8 +192,14 @@ class Project:
             project.model.add_arc(
                 GeoArc(ad["id"], ad["view_id"], ad["point_ids"],
                        Point2(*ad["control"])))
+        for sd in d.get("surfaces", []):
+            project.model.add_surface(
+                GeoSurface(sd["id"], sd["view_id"], sd["boundary_ids"],
+                           sd.get("opening_ids", [])))
         project.rfem_node_map = dict(d.get("rfem_node_map", {}))
         project.rfem_line_map = dict(d.get("rfem_line_map", {}))
+        project.rfem_surface_map = dict(d.get("rfem_surface_map", {}))
+        project.rfem_opening_map = dict(d.get("rfem_opening_map", {}))
         project.dirty = False
         return project
 

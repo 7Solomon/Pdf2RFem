@@ -13,8 +13,9 @@ from PySide6.QtCore import Qt
 
 from ..core.arcs import arc_midpoint, sample_arc
 from ..core.commands import (AddArcCmd, AddPointCmd, AddPolylineCmd,
-                             DeleteObjectsCmd, SetReferenceCmd)
-from ..core.geometry import GeoArc, GeoPoint, GeoPolyline, new_id
+                             AddSurfaceCmd, DeleteObjectsCmd, MergePointsCmd,
+                             SetReferenceCmd, SetSurfaceOpeningsCmd)
+from ..core.geometry import GeoArc, GeoPoint, GeoPolyline, GeoSurface, new_id
 from ..core.snap import SnapEngine, SnapResult
 from ..core.transform import Point2
 
@@ -43,6 +44,9 @@ class Tool:
         return False
 
     def activate(self) -> None: ...
+
+    def on_refresh(self) -> None:
+        """Wird nach jeder Modelaenderung aufgerufen (Overlays aktualisieren)."""
 
     def deactivate(self) -> None:
         self.ctrl.canvas.set_preview(None)
@@ -73,6 +77,12 @@ class SelectTool(Tool):
                 arc = model.find_arc_near(view.id, snap.pos, radius)
                 if arc is not None:
                     hit_id = arc.id
+                else:
+                    from ..core.faces import surface_contains
+                    for surface in model.surfaces_in_view(view.id):
+                        if surface_contains(model, surface, snap.pos):
+                            hit_id = surface.id
+                            break
         if mods & Qt.ControlModifier:
             if hit_id:
                 win.selection.symmetric_difference_update({hit_id})
@@ -87,9 +97,10 @@ class SelectTool(Tool):
             point_ids = {i for i in win.selection if i in model.points}
             line_ids = {i for i in win.selection if i in model.lines}
             arc_ids = {i for i in win.selection if i in model.arcs}
-            if point_ids or line_ids or arc_ids:
+            surface_ids = {i for i in win.selection if i in model.surfaces}
+            if point_ids or line_ids or arc_ids or surface_ids:
                 win.stack.push(DeleteObjectsCmd(point_ids, line_ids, model,
-                                                arc_ids))
+                                                arc_ids, surface_ids))
                 win.selection = set()
             return True
         if key == Qt.Key_Escape:
@@ -173,12 +184,16 @@ class PolylineTool(Tool):
         new_points: list[GeoPoint] = []
         point_ids: list[str] = []
         for pid, pos in self.vertices:
-            if pid is None:
-                gp = GeoPoint(new_id(), view.id, pos)
-                new_points.append(gp)
-                point_ids.append(gp.id)
-            else:
-                point_ids.append(pid)
+            rid = pid if pid is not None else self.ctrl.resolve_point_id(
+                view, pos, new_points)
+            if point_ids and point_ids[-1] == rid:
+                continue  # durch Fangtoleranz zusammengefallene Vertices
+            point_ids.append(rid)
+        if closed and len(point_ids) > 1 and point_ids[0] == point_ids[-1]:
+            point_ids.pop()
+        if len(point_ids) < 2 or (closed and len(point_ids) < 3):
+            win.show_status("Zu wenige eindeutige Punkte fuer eine Polylinie.")
+            return
         line = GeoPolyline(new_id(), view.id, point_ids, closed=closed)
         win.stack.push(AddPolylineCmd(new_points, line))
         self.reset()
@@ -333,17 +348,9 @@ class LineTraceTool(Tool):
             win.show_status(f"Bogen uebernommen (R = {r_m:.3f} m).")
 
     def _point_ids(self, view, positions: list[Point2]):
-        model = self.ctrl.window.project.model
         new_points: list[GeoPoint] = []
-        ids: list[str] = []
-        for pos in positions:
-            existing = model.find_point_near(view.id, pos, 0.5)
-            if existing is not None:
-                ids.append(existing.id)
-            else:
-                gp = GeoPoint(new_id(), view.id, pos)
-                new_points.append(gp)
-                ids.append(gp.id)
+        ids = [self.ctrl.resolve_point_id(view, pos, new_points)
+               for pos in positions]
         return ids, new_points
 
     def _commit_arc(self, view, start: Point2, end: Point2,
@@ -392,16 +399,13 @@ class ArcTool(Tool):
         win = self.ctrl.window
         (pid1, p1), (pid2, p2) = self.picked
         control = arc_midpoint(p1, through, p2)
-        model = win.project.model
         new_points: list[GeoPoint] = []
         ids: list[str] = []
         for pid, pos in self.picked:
             if pid is not None:
                 ids.append(pid)
             else:
-                gp = GeoPoint(new_id(), view.id, pos)
-                new_points.append(gp)
-                ids.append(gp.id)
+                ids.append(self.ctrl.resolve_point_id(view, pos, new_points))
         if ids[0] == ids[1]:
             win.show_status("Start- und Endpunkt muessen verschieden sein.")
             return
@@ -498,25 +502,15 @@ class RegionTool(Tool):
         if view is None or not self.polygon:
             return
         provider = self.ctrl.plan_provider()
-        model = win.project.model
         new_points: list[GeoPoint] = []
         ids: list[str] = []
-        last_pos: Optional[Point2] = None
         for v in self.polygon:
             # Raster-Ecke auf exakten Vektorpunkt ziehen, falls vorhanden
             pos = provider.snap_vertex(v, 3.0) if provider else v
-            if last_pos is not None and pos.dist(last_pos) < 0.5:
+            rid = self.ctrl.resolve_point_id(view, pos, new_points)
+            if rid in ids:
                 continue
-            existing = model.find_point_near(view.id, pos, 0.5)
-            if existing is not None:
-                if existing.id in ids:
-                    continue
-                ids.append(existing.id)
-            else:
-                gp = GeoPoint(new_id(), view.id, pos)
-                new_points.append(gp)
-                ids.append(gp.id)
-            last_pos = pos
+            ids.append(rid)
         if len(ids) < 3:
             win.show_status("Zu wenige eindeutige Ecken fuer ein Polygon.")
             return
@@ -535,6 +529,204 @@ class RegionTool(Tool):
         super().deactivate()
 
 
+class FillTool(Tool):
+    """Fuellen wie in Paint, aber auf der eigenen Geometrie: Klick in eine
+    von eigenen Linien umschlossene Flaeche -> Flaeche (GeoSurface). Innere
+    geschlossene Zuege werden automatisch als Aussparungen (Cutouts)
+    abgezogen. Linien zaehlen nur als verbunden, wenn sie denselben Knoten
+    teilen."""
+    name = "fill"
+    status_hint = ("In eine von eigenen Linien umschlossene Flaeche klicken "
+                   "- innere Loecher werden als Aussparung abgezogen.")
+    wants_snap = False
+
+    def on_press(self, snap: SnapResult, mods) -> None:
+        view = self.ctrl.require_ready_view()
+        if view is None:
+            return
+        from ..core.faces import find_enclosing_cycle
+        win = self.ctrl.window
+        model = win.project.model
+        result = find_enclosing_cycle(model, view.id, snap.pos)
+        if result is None:
+            msg = ("Kein geschlossener Linienzug um diesen Punkt gefunden. "
+                   "Linien muessen an gemeinsamen Knoten verbunden sein.")
+            loose = self._loose_near(view, snap.pos)
+            if loose:
+                msg += (f" Achtung: {loose} lose Linienenden in der Naehe - "
+                        "hier klafft vermutlich eine Luecke.")
+            win.show_status(msg)
+            return
+        if result.partial_objects:
+            win.show_status(
+                "Ein Linienzug liegt nur teilweise am Flaechenrand - "
+                "bitte die betroffene Polylinie in Einzellinien zeichnen/"
+                "abgreifen, damit die Flaeche sauber definiert ist.")
+            return
+        boundary_ids = result.boundary_ids
+        opening_ids = result.hole_boundary_ids
+        wanted = set(boundary_ids)
+        for surface in model.surfaces_in_view(view.id):
+            if set(surface.boundary_ids) == wanted:
+                win.selection = {surface.id}
+                cur = {frozenset(o) for o in surface.opening_ids}
+                new = {frozenset(o) for o in opening_ids}
+                if cur == new:
+                    win.refresh_all()
+                    win.show_status("Diese Flaeche existiert bereits (markiert).")
+                else:
+                    win.stack.push(SetSurfaceOpeningsCmd(surface, opening_ids))
+                    win.show_status(
+                        f"Vorhandene Flaeche aktualisiert: jetzt "
+                        f"{len(opening_ids)} Aussparung(en).")
+                return
+        surface = GeoSurface(new_id(), view.id, boundary_ids, opening_ids)
+        win.selection = {surface.id}
+        win.stack.push(AddSurfaceCmd(surface))
+        tf = view.transform()
+        area_m2 = result.area * tf.m_per_pt ** 2
+        parts = [f"Flaeche mit {len(boundary_ids)} Randobjekten"]
+        if opening_ids:
+            parts.append(f"{len(opening_ids)} Aussparung(en)")
+        msg = ", ".join(parts) + f" erzeugt ({area_m2:.3f} m² netto)."
+        if result.loose_ends:
+            msg += (f" Hinweis: {len(result.loose_ends)} lose Linienenden im "
+                    "Bereich - evtl. wurde eine Aussparung wegen einer Luecke "
+                    "NICHT erkannt.")
+        win.show_status(msg)
+
+    def _loose_near(self, view, pos: Point2) -> int:
+        from ..core.faces import _loose_ends
+        return sum(1 for p in _loose_ends(self.ctrl.window.project.model,
+                                          view.id)
+                   if p.dist(pos) < 60)
+
+
+class MergeTool(Tool):
+    """Lose Enden zusammenfuehren. Bei Auswahl werden alle losen Enden
+    (Knoten mit nur einer anhaengenden Linie) markiert. Klick auf/neben ein
+    loses Ende fuehrt es mit dem naechsten Knoten in Reichweite zusammen.
+    Enter fuehrt alle Enden automatisch zusammen, die naeher als die
+    Auto-Toleranz beieinander liegen."""
+    name = "merge"
+    status_hint = ("Lose Enden (rot) zusammenfuehren: auf ein Ende klicken = "
+                   "mit naechstem Knoten verbinden | Enter = alle nahen "
+                   "automatisch | Esc = Auswahl")
+    needs_ready_view = False
+    wants_snap = False
+
+    CLICK_MAX_PT = 25.0    # manueller Klick: so weit wird ein Partner gesucht
+    AUTO_TOL_PT = 4.0      # Enter: nur eindeutig nahe Enden automatisch
+
+    def activate(self) -> None:
+        self.on_refresh()
+
+    def deactivate(self) -> None:
+        self.ctrl.canvas.set_loose_ends([])
+        super().deactivate()
+
+    def on_refresh(self) -> None:
+        view = self.ctrl.window.project.active_view if self.ctrl.window.project else None
+        if view is None:
+            self.ctrl.canvas.set_loose_ends([])
+            return
+        ends = self.ctrl.window.project.model.loose_ends(view.id)
+        self.ctrl.canvas.set_loose_ends([p.pos for p in ends])
+
+    def _partner(self, model, view_id, node_id, max_pt):
+        """Naechster anderer Knoten (Grad>=1) zum gegebenen Knoten, der nicht
+        schon per Segment mit ihm verbunden ist."""
+        deg = model.node_degree(view_id)
+        pos = model.points[node_id].pos
+        connected = self._connected_nodes(model, node_id)
+        best, best_d = None, max_pt
+        for p in model.points_in_view(view_id):
+            if p.id == node_id or deg.get(p.id, 0) < 1:
+                continue
+            if p.id in connected:
+                continue   # schon direkt verbunden -> wuerde degenerieren
+            d = pos.dist(p.pos)
+            if d <= best_d:
+                best, best_d = p.id, d
+        return best
+
+    @staticmethod
+    def _connected_nodes(model, node_id) -> set:
+        out = set()
+        for l in model.lines.values():
+            if node_id in l.point_ids:
+                out.update(l.point_ids)
+        for a in model.arcs.values():
+            if node_id in a.point_ids:
+                out.update(a.point_ids)
+        return out
+
+    def on_press(self, snap: SnapResult, mods) -> None:
+        win = self.ctrl.window
+        view = win.project.active_view if win.project else None
+        if view is None:
+            return
+        model = win.project.model
+        ends = model.loose_ends(view.id)
+        if not ends:
+            win.show_status("Keine losen Enden in dieser Ansicht.")
+            return
+        # loses Ende, das dem Klick am naechsten ist (grosszuegig)
+        radius = 20.0 / max(self.ctrl.canvas.current_scale(), 1e-9)
+        victim = min(ends, key=lambda p: p.pos.dist(snap.pos))
+        if victim.pos.dist(snap.pos) > radius:
+            win.show_status("Kein loses Ende in Klicknaehe.")
+            return
+        partner = self._partner(model, view.id, victim.id, self.CLICK_MAX_PT)
+        if partner is None:
+            win.show_status(
+                "Kein Partnerknoten in Reichweite - naeher heranzoomen oder "
+                "der Nachbar ist zu weit entfernt.")
+            return
+        d_pt = victim.pos.dist(model.points[partner].pos)
+        win.stack.push(MergePointsCmd(victim.id, partner, model))
+        tf = view.transform()
+        d_mm = tf.pdf_dist_to_meters(d_pt) * 1000 if tf else 0.0
+        win.show_status(f"Zusammengefuehrt (Luecke {d_pt:.1f} pt / "
+                        f"{d_mm:.0f} mm). Verbleibend: "
+                        f"{len(model.loose_ends(view.id))} lose Enden.")
+
+    def on_key(self, key) -> bool:
+        if key in (Qt.Key_Return, Qt.Key_Enter):
+            self._auto_merge_all()
+            return True
+        if key == Qt.Key_Escape:
+            self.ctrl.window.set_tool("select")
+            return True
+        return False
+
+    def _auto_merge_all(self) -> None:
+        win = self.ctrl.window
+        view = win.project.active_view if win.project else None
+        if view is None:
+            return
+        model = win.project.model
+        merged = 0
+        # iterativ, da sich Grade nach jedem Merge aendern
+        while True:
+            ends = model.loose_ends(view.id)
+            pair = None
+            for p in ends:
+                partner = self._partner(model, view.id, p.id, self.AUTO_TOL_PT)
+                if partner is not None:
+                    pair = (p.id, partner)
+                    break
+            if pair is None:
+                break
+            win.stack.push(MergePointsCmd(pair[0], pair[1], model))
+            merged += 1
+        remaining = len(model.loose_ends(view.id))
+        win.show_status(
+            f"{merged} Paar(e) automatisch zusammengefuehrt "
+            f"(Toleranz {self.AUTO_TOL_PT:.0f} pt). Verbleibend: "
+            f"{remaining} lose Enden (zu weit - manuell anklicken).")
+
+
 class ToolController:
     def __init__(self, window, canvas) -> None:
         self.window = window
@@ -542,9 +734,10 @@ class ToolController:
         self.snap_engine = SnapEngine()
         self.tools: dict[str, Tool] = {
             t.name: t for t in (SelectTool(self), PointTool(self),
-                                PolylineTool(self), RefPointTool(self),
-                                MeasureTool(self), LineTraceTool(self),
-                                RegionTool(self))
+                                PolylineTool(self), ArcTool(self),
+                                RefPointTool(self), MeasureTool(self),
+                                LineTraceTool(self), RegionTool(self),
+                                FillTool(self), MergeTool(self))
         }
         self.active: Tool = self.tools["select"]
 
@@ -573,6 +766,33 @@ class ToolController:
     def plan_provider(self):
         """Plan-Snap-Provider (Vektor/Raster) fuer die angezeigte Seite."""
         return self.window.get_plan_provider(self.canvas.page_index)
+
+    def reuse_tolerance(self) -> float:
+        """Fangtoleranz fuer Knoten-Wiederverwendung (PDF-Punkte): an den
+        Bildschirm gekoppelt - was auf dem Schirm 'derselbe Punkt' ist,
+        wird derselbe Knoten - aber nach oben gedeckelt, damit beim
+        Herauszoomen keine echten Nachbarknoten verschmelzen."""
+        return max(0.3, min(3.0, SNAP_RADIUS_PX
+                            / max(self.canvas.current_scale(), 1e-9)))
+
+    def resolve_point_id(self, view, pos: Point2,
+                         new_points: list[GeoPoint]) -> str:
+        """Knoten in Fangnaehe wiederverwenden statt Duplikat zu erzeugen.
+
+        Prueft vorhandene Modellpunkte UND die im laufenden Commit bereits
+        erzeugten Punkte; erst wenn nichts passt, entsteht ein neuer Punkt
+        (wird an new_points angehaengt).
+        """
+        tol = self.reuse_tolerance()
+        existing = self.window.project.model.find_point_near(view.id, pos, tol)
+        if existing is not None:
+            return existing.id
+        for gp in new_points:
+            if gp.pos.dist(pos) <= tol:
+                return gp.id
+        gp = GeoPoint(new_id(), view.id, pos)
+        new_points.append(gp)
+        return gp.id
 
     # --- Event-Eingang von der Canvas -------------------------------------
     def _snapped(self, raw: Point2, mods) -> SnapResult:

@@ -27,21 +27,58 @@ ist in `%LOCALAPPDATA%\Dlubal\api\config.ini` hinterlegt (Standard von
    **C** = geschlossen, **Ruecktaste** = Vertex zurueck, **Esc** = abbrechen).
    Snap auf vorhandene Punkte laeuft automatisch - gesnappte Punkte werden
    in RFEM zum selben Knoten.
-5. **Plan-Snap (G)**: Der Cursor faengt zusaetzlich, was schon im Plan
+5. **B** Kreisbogen zeichnen: Startpunkt, Endpunkt, dann einen Punkt auf
+   dem Bogen klicken. Wird in RFEM zur echten Arc-Linie.
+6. **Plan-Snap (G)**: Der Cursor faengt zusaetzlich, was schon im Plan
    gezeichnet ist - Schnittpunkte vorhandener Linien (magenta),
    Linienenden (hellblau), Punkt-auf-Linie (violett). Bei Vektor-PDFs
    exakt aus den PDF-Pfaden; bei gescannten Plaenen per OpenCV-
    Eckenerkennung (orange) im Ausschnitt um den Cursor.
-6. **T** Linie abgreifen: vorhandene Plan-Linie anklicken -> wird als
-   Geometrie uebernommen (nur Vektor-PDFs).
-7. **F** Flaeche aufnehmen: in eine gefuellte Flaeche (z.B. Grauton)
+7. **T** Abgreifen: vorhandene Plan-Linie ODER Plan-Kreisbogen anklicken
+   -> wird als Geometrie uebernommen (nur Vektor-PDFs). Kreise/Boegen
+   werden aus den Bezier-Pfaden des PDFs rekonstruiert (Kreis-Fit +
+   Verkettung); ein Vollkreis wird als zwei Halbboegen uebernommen.
+8. **F** Flaeche aufnehmen: in eine gefuellte PDF-Flaeche (z.B. Grauton)
    klicken -> Umriss wird per Flood-Fill erkannt, vereinfacht und auf
    exakte Vektorecken gezogen; **Enter** uebernimmt als geschlossenes
    Polygon, **+/-** aendert die Farbtoleranz. Fuer grosse Flaechen erst
    so zoomen, dass die Flaeche komplett sichtbar ist.
-8. **F5** - nach RFEM uebertragen (mit Vorschau). Wiederholte Uebertragung
-   aktualisiert vorhandene Objekte statt sie zu duplizieren.
-9. **Strg+S** - Projekt als JSON speichern (inkl. RFEM-Zuordnungen).
+8b. **K** Fuellen (wie in Paint, aber auf der EIGENEN Geometrie): Klick in
+   einen Bereich, der von eigenen Linien/Boegen umschlossen ist -> der
+   kleinste geschlossene Zug um den Klickpunkt wird zur FLAECHE
+   (GeoSurface). Die Flaeche referenziert ihre Randobjekte - genau wie
+   RFEM-Surfaces (boundary_lines) - und wird schraffiert dargestellt;
+   Bogenraender sind dabei voll unterstuetzt. Innere geschlossene Zuege
+   werden automatisch als AUSSPARUNGEN (Cutouts) abgezogen und in RFEM zu
+   Opening-Objekten - so bleibt z.B. der Hohlraum eines Kastenquerschnitts
+   frei. Wird eine bereits (ohne Loch) gefuellte Flaeche erneut gefuellt,
+   werden die Aussparungen nachgetragen. Linien zaehlen nur als verbunden,
+   wenn sie denselben Knoten teilen - dank Knoten-Wiederverwendung (s.u.)
+   passiert das beim Zeichnen automatisch. Klafft eine Luecke (lose
+   Linienenden), warnt die Statuszeile - dann wird das betroffene Loch
+   nicht erkannt. Loeschen einer Randlinie loescht die abhaengige Flaeche
+   mit (undo-faehig).
+9. **A** Lupe: vergroessertes Fenster oben rechts folgt dem Cursor
+   (scharf nachgerendert, inkl. eigener Geometrie und Fadenkreuz);
+   weicht automatisch zur anderen Ecke aus, wenn der Cursor ihr nahekommt.
+10. **F5** - nach RFEM uebertragen (mit Vorschau). Wiederholte Uebertragung
+    aktualisiert vorhandene Objekte statt sie zu duplizieren; Boegen als
+    RFEM-Arc (2 Knoten + Kontrollpunkt), Flaechen als RFEM-Surface ueber
+    ihre Randlinien, Aussparungen als RFEM-Opening (Dicke/Material danach
+    in RFEM zuweisen).
+11. **Strg+S** - Projekt als JSON speichern (inkl. RFEM-Zuordnungen).
+
+Die Toolbar ist gruppiert: Datei | Zeichnen (Auswahl, Punkt, Polylinie,
+Bogen) | Abgreifen (Linie/Bogen, Flaeche, Fuellen) | Einrichten (Referenz,
+Messen) | Anzeige (Plan-Snap, Lupe, Einpassen) | Verlauf | RFEM.
+
+**Knoten-Wiederverwendung:** Alle Werkzeuge (Polylinie, Bogen, Abgreifen,
+Flaeche) verwenden beim Erzeugen von Punkten denselben Fangmechanismus:
+liegt in Bildschirmnaehe (ca. 12 px, gedeckelt auf 3 PDF-Punkte) schon ein
+Knoten, wird er referenziert statt dupliziert. Zwei nacheinander
+abgegriffene Nachbarkanten eines Polygonzugs treffen sich dadurch
+automatisch in EINEM Knoten - wichtig fuer zusammenhaengende FEM-Modelle
+und Voraussetzung fuer das Fuellen-Werkzeug.
 
 Weitere Bedienung: Mausrad = Zoom, mittlere Maustaste = Pan, Strg+0 =
 einpassen, **S** = Auswahl-Werkzeug, Entf = Loeschen, Strg+Z/Y = Undo/Redo.
@@ -56,7 +93,9 @@ die 3D-Geometrie aus 2D-Ansichten zusammen.
 pdf2rfem/
   core/        Qt-freie Logik (per pytest getestet)
     transform.py   Massstab, Workplane, ViewTransform (PDF-Punkt -> RFEM-m)
-    geometry.py    GeoPoint/GeoPolyline, GeometryModel
+    geometry.py    GeoPoint/GeoPolyline/GeoArc, GeometryModel
+    arcs.py        Kreisbogen-Geometrie (3-Punkt-Definition wie RFEM)
+    faces.py       Fuellen: kleinster geschlossener Linienzug um einen Punkt
     commands.py    Undo/Redo (Command-Pattern), auch fuer Referenzpunkte
     snap.py        SnapEngine (Punkt-Snap, Ortho)
     project.py     Projekt, Ansichten, JSON-Serialisierung
@@ -80,11 +119,20 @@ Aenderungen an Referenzpunkt/Massstab rechnen alles automatisch neu.
       Undo/Redo, RFEM-Transfer (idempotent), Projekt-JSON, Massstabspruefung
 - [x] Plan-Snap: Vektor-Schnittpunkte/-Endpunkte aus PDF-Pfaden,
       OpenCV-Ecken-Fallback fuer Scans
-- [x] Linie abgreifen (T), Flaeche aufnehmen per Grauton-Flood-Fill (F)
-- [ ] Geschlossene Polygone als RFEM-Surfaces uebertragen
+- [x] Linie/Bogen abgreifen (T), Flaeche aufnehmen per Grauton-Flood-Fill (F)
+- [x] Kreisboegen: Erkennung aus PDF-Beziers, Zeichenwerkzeug (B),
+      RFEM-Transfer als Arc-Linie
+- [x] Lupe am Cursor (A), gruppierte Toolbar mit Icons
+- [x] Knoten-Wiederverwendung ueber alle Werkzeuge (keine Duplikat-Knoten)
+- [x] Fuellen-Werkzeug (K): Klick in umschlossenen Bereich -> Flaeche
+      (auch mit Bogenrand)
+- [x] Flaechen als RFEM-Surfaces ueber Randlinien uebertragen
       (Dicke wird in RFEM nachgepflegt)
+- [x] Aussparungen/Cutouts: Loecher automatisch erkennen (Fuellen) und als
+      RFEM-Openings uebertragen; Warnung bei losen Linienenden
 - [ ] Validierung vor Transfer (Duplikat-Knoten mit Toleranz, offene Zuege)
-- [ ] Lupe am Cursor, numerische Laengen-/Winkeleingabe beim Zeichnen
+- [ ] Luecken automatisch schliessen (lose Enden zusammenfuehren)
+- [ ] Numerische Laengen-/Winkeleingabe beim Zeichnen
 - [ ] Linienzug-Verfolgung (ganze Kette statt Einzelsegment abgreifen)
 - [ ] Konstruktionslinien, Spiegeln/Reihen (Pfeiler), DXF-Export
 - [ ] OCR der Bemassungstexte als Massstabs-/Laengenkontrolle

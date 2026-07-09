@@ -34,6 +34,15 @@ def _to_pixmap(rp: RenderedPage) -> QPixmap:
     return QPixmap.fromImage(img)  # kopiert; samples duerfen danach weg
 
 
+def _add_subpath(path: QPainterPath, pts: list) -> None:
+    if not pts:
+        return
+    path.moveTo(pts[0].x, pts[0].y)
+    for p in pts[1:]:
+        path.lineTo(p.x, p.y)
+    path.closeSubpath()
+
+
 class PdfCanvas(QGraphicsView):
     mouse_moved = Signal(object)          # Point2 (Plan-Koordinaten)
     mouse_left_view = Signal()
@@ -50,6 +59,7 @@ class PdfCanvas(QGraphicsView):
         self.setBackgroundBrush(QBrush(QColor("#3c3f41")))
 
         self.controller = None            # wird vom MainWindow gesetzt
+        self.magnifier = None             # optionales Lupen-Overlay
         self.pdf: Optional[PdfDocument] = None
         self.page_index: Optional[int] = None
 
@@ -80,6 +90,11 @@ class PdfCanvas(QGraphicsView):
         self._snap_marker.setZValue(6)
         self._snap_marker.setVisible(False)
         self.scene().addItem(self._snap_marker)
+
+        self._loose_group = QGraphicsItemGroup()
+        self._loose_group.setZValue(7)
+        self._loose_group.setHandlesChildEvents(False)
+        self.scene().addItem(self._loose_group)
 
         self._base_zoom = 1.0
         self._panning = False
@@ -174,6 +189,21 @@ class PdfCanvas(QGraphicsView):
     SNAP_COLORS = {"point": "#00e676", "isect": "#ff4081", "vend": "#40c4ff",
                    "corner": "#ffab40", "online": "#b388ff", "ortho": "#00b0ff"}
 
+    def set_loose_ends(self, points: list) -> None:
+        """Markiert lose Enden (rote Rauten mit weissem Kern, feste Groesse)."""
+        for item in list(self._loose_group.childItems()):
+            self._loose_group.removeFromGroup(item)
+            self.scene().removeItem(item)
+        for p in points:
+            marker = QGraphicsRectItem(-6, -6, 12, 12)
+            marker.setFlag(QGraphicsItem.ItemIgnoresTransformations)
+            marker.setPos(p.x, p.y)
+            marker.setRotation(45)
+            pen = QPen(QColor("#d50000"), 2)
+            marker.setPen(pen)
+            marker.setBrush(QBrush(QColor("#ffffff")))
+            self._loose_group.addToGroup(marker)
+
     def set_snap_marker(self, pos: Optional[Point2], kind: str = "free") -> None:
         if pos is None or kind == "free":
             self._snap_marker.setVisible(False)
@@ -198,6 +228,25 @@ class PdfCanvas(QGraphicsView):
                 continue
             color = QColor(view.color)
             model = project.model
+            from ..core.faces import surface_outline
+            for surface in model.surfaces_in_view(view.id):
+                outline = surface_outline(model, surface)
+                if outline is None:
+                    continue
+                outer, holes = outline
+                path = QPainterPath()
+                path.setFillRule(Qt.OddEvenFill)   # Loecher werden ausgespart
+                _add_subpath(path, outer)
+                for hole in holes:
+                    _add_subpath(path, hole)
+                item = QGraphicsPathItem(path)
+                selected = surface.id in selection
+                fill = QColor("#ffd600") if selected else QColor(color)
+                fill.setAlpha(70 if selected else 45)
+                item.setBrush(QBrush(fill))
+                item.setPen(Qt.NoPen)   # Rand zeichnen die Linien/Boegen selbst
+                item.setZValue(-1)
+                self._obj_group.addToGroup(item)
             for line in model.lines_in_view(view.id):
                 pts = [model.points[pid].pos for pid in line.point_ids]
                 if len(pts) < 2:
@@ -293,6 +342,8 @@ class PdfCanvas(QGraphicsView):
             self.mouse_moved.emit(p)
             if self.controller:
                 self.controller.on_move(p, event.modifiers())
+            if self.magnifier is not None:
+                self.magnifier.track(p)
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:

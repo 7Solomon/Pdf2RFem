@@ -43,6 +43,25 @@ class GeoArc:
     control: Point2
 
 
+@dataclass
+class GeoSurface:
+    """Flaeche, definiert ueber ihre Randobjekte (Linien/Boegen) in
+    Umlaufreihenfolge - exakt die Surface-Definition von RFEM
+    (boundary_lines). Traegt keine eigene Geometrie; der Umriss wird aus
+    den referenzierten Objekten rekonstruiert. opening_ids: je Aussparung
+    ein Randzug (wird in RFEM zu einem Opening-Objekt)."""
+    id: str
+    view_id: str
+    boundary_ids: list[str]   # GeoPolyline-/GeoArc-IDs in Umlaufreihenfolge
+    opening_ids: list[list[str]] = field(default_factory=list)
+
+    def all_object_ids(self) -> list[str]:
+        ids = list(self.boundary_ids)
+        for hole in self.opening_ids:
+            ids.extend(hole)
+        return ids
+
+
 class GeometryModel:
     """Zentrale Objektverwaltung. Qt-frei; GUI haengt sich als Listener an."""
 
@@ -50,6 +69,7 @@ class GeometryModel:
         self.points: dict[str, GeoPoint] = {}
         self.lines: dict[str, GeoPolyline] = {}
         self.arcs: dict[str, GeoArc] = {}
+        self.surfaces: dict[str, GeoSurface] = {}
         self._listeners: list[Callable[[], None]] = []
 
     # --- Listener ---------------------------------------------------------
@@ -76,7 +96,19 @@ class GeometryModel:
         self.lines[line.id] = line
 
     def remove_line(self, lid: str) -> None:
+        if self.surfaces_using_object(lid):
+            raise ValueError(f"Linie {lid} wird noch von Flaechen verwendet")
         del self.lines[lid]
+
+    def add_surface(self, surface: GeoSurface) -> None:
+        for oid in surface.all_object_ids():
+            if oid not in self.lines and oid not in self.arcs:
+                raise ValueError(
+                    f"Flaeche referenziert unbekanntes Randobjekt {oid}")
+        self.surfaces[surface.id] = surface
+
+    def remove_surface(self, sid: str) -> None:
+        del self.surfaces[sid]
 
     def add_arc(self, arc: GeoArc) -> None:
         for pid in arc.point_ids:
@@ -85,6 +117,8 @@ class GeometryModel:
         self.arcs[arc.id] = arc
 
     def remove_arc(self, aid: str) -> None:
+        if self.surfaces_using_object(aid):
+            raise ValueError(f"Bogen {aid} wird noch von Flaechen verwendet")
         del self.arcs[aid]
 
     # --- Abfragen -----------------------------------------------------------
@@ -93,6 +127,35 @@ class GeometryModel:
 
     def arcs_using_point(self, pid: str) -> list[GeoArc]:
         return [a for a in self.arcs.values() if pid in a.point_ids]
+
+    def surfaces_using_object(self, obj_id: str) -> list[GeoSurface]:
+        return [s for s in self.surfaces.values()
+                if obj_id in s.all_object_ids()]
+
+    def surfaces_in_view(self, view_id: str) -> list[GeoSurface]:
+        return [s for s in self.surfaces.values() if s.view_id == view_id]
+
+    def node_degree(self, view_id: str) -> dict[str, int]:
+        """Anzahl anhaengender Linien-Segmente + Boegen je Knoten."""
+        deg: dict[str, int] = {}
+        for line in self.lines_in_view(view_id):
+            ids = line.point_ids
+            pairs = list(zip(ids, ids[1:]))
+            if line.closed and len(ids) > 2:
+                pairs.append((ids[-1], ids[0]))
+            for a, b in pairs:
+                deg[a] = deg.get(a, 0) + 1
+                deg[b] = deg.get(b, 0) + 1
+        for arc in self.arcs_in_view(view_id):
+            for pid in arc.point_ids:
+                deg[pid] = deg.get(pid, 0) + 1
+        return deg
+
+    def loose_ends(self, view_id: str) -> list[GeoPoint]:
+        """Punkte mit genau einer anhaengenden Linie/Bogen (Grad 1) -
+        moegliche Luecken. Punkte ganz ohne Linie (Grad 0) zaehlen NICHT."""
+        deg = self.node_degree(view_id)
+        return [self.points[pid] for pid, d in deg.items() if d == 1]
 
     def points_in_view(self, view_id: str) -> list[GeoPoint]:
         return [p for p in self.points.values() if p.view_id == view_id]
@@ -143,7 +206,8 @@ class GeometryModel:
         return best
 
     def is_empty(self) -> bool:
-        return not self.points and not self.lines and not self.arcs
+        return (not self.points and not self.lines and not self.arcs
+                and not self.surfaces)
 
 
 def _dist_point_segment(p: Point2, a: Point2, b: Point2) -> float:

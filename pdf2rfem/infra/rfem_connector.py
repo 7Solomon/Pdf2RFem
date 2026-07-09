@@ -41,9 +41,25 @@ class LineTransfer:
 
 
 @dataclass
+class OpeningTransfer:
+    key: str                   # stabile ID: f"{surface_id}#<index>"
+    boundary_ids: list[str]    # interne Objekt-IDs der Loch-Randlinien/-boegen
+    no: Optional[int] = None
+
+
+@dataclass
+class SurfaceTransfer:
+    surface_id: str
+    boundary_ids: list[str]    # interne Objekt-IDs der Randlinien/-boegen
+    no: Optional[int] = None
+    openings: list[OpeningTransfer] = field(default_factory=list)
+
+
+@dataclass
 class TransferPlan:
     nodes: list[NodeTransfer] = field(default_factory=list)
     lines: list[LineTransfer] = field(default_factory=list)
+    surfaces: list[SurfaceTransfer] = field(default_factory=list)
     skipped_views: list[str] = field(default_factory=list)
 
     @property
@@ -54,6 +70,14 @@ class TransferPlan:
     def new_line_count(self) -> int:
         return sum(1 for l in self.lines if l.no is None)
 
+    @property
+    def new_surface_count(self) -> int:
+        return sum(1 for s in self.surfaces if s.no is None)
+
+    @property
+    def openings(self) -> list["OpeningTransfer"]:
+        return [o for s in self.surfaces for o in s.openings]
+
     def summary(self) -> str:
         parts = [
             f"Knoten: {self.new_node_count} neu, "
@@ -61,6 +85,15 @@ class TransferPlan:
             f"Linien: {self.new_line_count} neu, "
             f"{len(self.lines) - self.new_line_count} aktualisieren",
         ]
+        if self.surfaces:
+            parts.append(
+                f"Flaechen: {self.new_surface_count} neu, "
+                f"{len(self.surfaces) - self.new_surface_count} aktualisieren")
+        if self.openings:
+            new_op = sum(1 for o in self.openings if o.no is None)
+            parts.append(
+                f"Aussparungen: {new_op} neu, "
+                f"{len(self.openings) - new_op} aktualisieren")
         if self.skipped_views:
             parts.append(
                 "Uebersprungen (kein Referenzpunkt): "
@@ -69,7 +102,7 @@ class TransferPlan:
 
     @property
     def is_empty(self) -> bool:
-        return not self.nodes and not self.lines
+        return not self.nodes and not self.lines and not self.surfaces
 
 
 def build_plan(project: Project) -> TransferPlan:
@@ -96,6 +129,17 @@ def build_plan(project: Project) -> TransferPlan:
                 arc.id, list(arc.point_ids), closed=False,
                 no=project.rfem_line_map.get(arc.id),
                 arc_control=(round(cx, 6), round(cy, 6), round(cz, 6))))
+        for surface in project.model.surfaces_in_view(view.id):
+            openings = []
+            for idx, hole_ids in enumerate(surface.opening_ids):
+                key = f"{surface.id}#{idx}"
+                openings.append(OpeningTransfer(
+                    key, list(hole_ids),
+                    no=project.rfem_opening_map.get(key)))
+            plan.surfaces.append(SurfaceTransfer(
+                surface.id, list(surface.boundary_ids),
+                no=project.rfem_surface_map.get(surface.id),
+                openings=openings))
     return plan
 
 
@@ -147,6 +191,8 @@ class RfemConnector:
 
         existing_nodes = self._existing_numbers(rfem.OBJECT_TYPE_NODE)
         existing_lines = self._existing_numbers(rfem.OBJECT_TYPE_LINE)
+        existing_surfaces = self._existing_numbers(rfem.OBJECT_TYPE_SURFACE)
+        existing_openings = self._existing_numbers(rfem.OBJECT_TYPE_OPENING)
 
         # Zuordnungen, deren Objekt in RFEM inzwischen geloescht wurde,
         # als "neu" behandeln statt ins Leere zu aktualisieren.
@@ -156,11 +202,23 @@ class RfemConnector:
         for l in plan.lines:
             if l.no is not None and l.no not in existing_lines:
                 l.no = None
+        for s in plan.surfaces:
+            if s.no is not None and s.no not in existing_surfaces:
+                s.no = None
+            for o in s.openings:
+                if o.no is not None and o.no not in existing_openings:
+                    o.no = None
 
         next_node = max(existing_nodes | set(project.rfem_node_map.values()),
                         default=0) + 1
         next_line = max(existing_lines | set(project.rfem_line_map.values()),
                         default=0) + 1
+        next_surface = max(existing_surfaces
+                           | set(project.rfem_surface_map.values()),
+                           default=0) + 1
+        next_opening = max(existing_openings
+                           | set(project.rfem_opening_map.values()),
+                           default=0) + 1
 
         new_nodes, upd_nodes = [], []
         node_no_by_point: dict[str, int] = {}
@@ -199,8 +257,47 @@ class RfemConnector:
                     no=l.no, type=rfem.structure_core.Line.TYPE_POLYLINE,
                     definition_nodes=nos))
 
+        # Flaechen: Randobjekte -> RFEM-Liniennummern
+        line_no_by_obj = {l.line_id: l.no for l in plan.lines}
+        new_surfaces, upd_surfaces = [], []
+        for s in plan.surfaces:
+            boundary_nos = [line_no_by_obj.get(oid)
+                            or project.rfem_line_map.get(oid)
+                            for oid in s.boundary_ids]
+            if any(no is None for no in boundary_nos):
+                raise RfemError(
+                    f"Flaeche {s.surface_id}: Randlinie ohne RFEM-Nummer - "
+                    "Randobjekte zuerst uebertragen.")
+            if s.no is None:
+                s.no = next_surface
+                next_surface += 1
+                bucket = new_surfaces
+            else:
+                bucket = upd_surfaces
+            bucket.append(rfem.structure_core.Surface(
+                no=s.no, boundary_lines=boundary_nos))
+
+        # Aussparungen (Openings): eigene Randlinien, liegen auf der Flaeche
+        new_openings, upd_openings = [], []
+        for s in plan.surfaces:
+            for o in s.openings:
+                boundary_nos = [line_no_by_obj.get(oid)
+                                or project.rfem_line_map.get(oid)
+                                for oid in o.boundary_ids]
+                if any(no is None for no in boundary_nos):
+                    raise RfemError(
+                        f"Aussparung {o.key}: Randlinie ohne RFEM-Nummer.")
+                if o.no is None:
+                    o.no = next_opening
+                    next_opening += 1
+                    bucket = new_openings
+                else:
+                    bucket = upd_openings
+                bucket.append(rfem.structure_core.Opening(
+                    no=o.no, boundary_lines=boundary_nos))
+
         try:
-            # Erst Knoten, dann Linien - Linien referenzieren Knotennummern.
+            # Reihenfolge: Knoten -> Linien -> Flaechen -> Aussparungen.
             if new_nodes:
                 self.app.create_object_list(new_nodes)
             if upd_nodes:
@@ -209,6 +306,14 @@ class RfemConnector:
                 self.app.create_object_list(new_lines)
             if upd_lines:
                 self.app.update_object_list(upd_lines)
+            if new_surfaces:
+                self.app.create_object_list(new_surfaces)
+            if upd_surfaces:
+                self.app.update_object_list(upd_surfaces)
+            if new_openings:
+                self.app.create_object_list(new_openings)
+            if upd_openings:
+                self.app.update_object_list(upd_openings)
         except Exception as e:
             raise RfemError(f"Uebertragung fehlgeschlagen:\n{e}") from e
 
@@ -217,11 +322,23 @@ class RfemConnector:
             project.rfem_node_map[n.point_id] = n.no
         for l in plan.lines:
             project.rfem_line_map[l.line_id] = l.no
+        for s in plan.surfaces:
+            project.rfem_surface_map[s.surface_id] = s.no
+            for o in s.openings:
+                project.rfem_opening_map[o.key] = o.no
         project.dirty = True
 
-        return (f"Uebertragen: {len(new_nodes)} Knoten neu, "
-                f"{len(upd_nodes)} aktualisiert; "
-                f"{len(new_lines)} Linien neu, {len(upd_lines)} aktualisiert.")
+        msg = (f"Uebertragen: {len(new_nodes)} Knoten neu, "
+               f"{len(upd_nodes)} aktualisiert; "
+               f"{len(new_lines)} Linien neu, {len(upd_lines)} aktualisiert")
+        if plan.surfaces:
+            msg += (f"; {len(new_surfaces)} Flaechen neu, "
+                    f"{len(upd_surfaces)} aktualisiert "
+                    "(Dicke/Material in RFEM zuweisen)")
+        if plan.openings:
+            msg += (f"; {len(new_openings)} Aussparungen neu, "
+                    f"{len(upd_openings)} aktualisiert")
+        return msg + "."
 
     # --- intern -----------------------------------------------------------------
     def _ensure_model(self, rfem) -> None:

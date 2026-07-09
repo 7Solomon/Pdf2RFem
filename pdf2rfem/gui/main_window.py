@@ -9,7 +9,7 @@ import traceback
 from pathlib import Path
 from typing import Callable, Optional
 
-from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtCore import QSize, Qt, QThread, Signal
 from PySide6.QtGui import QAction, QActionGroup, QColor, QKeySequence
 from PySide6.QtWidgets import (QFileDialog, QLabel, QListWidget,
                                QListWidgetItem, QDockWidget, QHBoxLayout,
@@ -64,6 +64,9 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(self.canvas)
         self.controller = ToolController(self, self.canvas)
         self.canvas.controller = self.controller
+        from .magnifier import Magnifier
+        self.magnifier = Magnifier(self.canvas, self)
+        self.canvas.magnifier = self.magnifier
         self.canvas.mouse_moved.connect(self._on_mouse_moved)
         self.canvas.mouse_left_view.connect(
             lambda: self.coords_label.setText(""))
@@ -75,19 +78,21 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------------ UI-Aufbau
     def _build_actions(self) -> None:
+        from .icons import make_icon
         menu = self.menuBar()
-        toolbar = self.addToolBar("Werkzeuge")
-        toolbar.setMovable(False)
 
+        # --- Datei -------------------------------------------------------------
         m_file = menu.addMenu("&Datei")
-        self.act_open_pdf = QAction("PDF oeffnen (neues Projekt)...", self)
+        self.act_open_pdf = QAction(make_icon("open_pdf"), "PDF oeffnen", self)
         self.act_open_pdf.setShortcut(QKeySequence("Ctrl+N"))
+        self.act_open_pdf.setToolTip("PDF-Plan oeffnen, neues Projekt (Strg+N)")
         self.act_open_pdf.triggered.connect(self.open_pdf)
         self.act_open_project = QAction("Projekt oeffnen...", self)
         self.act_open_project.setShortcut(QKeySequence.Open)
         self.act_open_project.triggered.connect(self.open_project)
-        self.act_save = QAction("Projekt speichern", self)
+        self.act_save = QAction(make_icon("save"), "Speichern", self)
         self.act_save.setShortcut(QKeySequence.Save)
+        self.act_save.setToolTip("Projekt speichern (Strg+S)")
         self.act_save.triggered.connect(self.save_project)
         self.act_save_as = QAction("Projekt speichern unter...", self)
         self.act_save_as.triggered.connect(lambda: self.save_project(save_as=True))
@@ -99,47 +104,72 @@ class MainWindow(QMainWindow):
         act_quit.triggered.connect(self.close)
         m_file.addAction(act_quit)
 
+        # --- Bearbeiten -----------------------------------------------------------
         m_edit = menu.addMenu("&Bearbeiten")
-        self.act_undo = QAction("Rueckgaengig", self)
+        self.act_undo = QAction(make_icon("undo"), "Rueckgaengig", self)
         self.act_undo.setShortcut(QKeySequence.Undo)
+        self.act_undo.setToolTip("Rueckgaengig (Strg+Z)")
         self.act_undo.triggered.connect(lambda: self.stack and self.stack.undo())
-        self.act_redo = QAction("Wiederholen", self)
+        self.act_redo = QAction(make_icon("redo"), "Wiederholen", self)
         self.act_redo.setShortcut(QKeySequence.Redo)
+        self.act_redo.setToolTip("Wiederholen (Strg+Y)")
         self.act_redo.triggered.connect(lambda: self.stack and self.stack.redo())
         m_edit.addAction(self.act_undo)
         m_edit.addAction(self.act_redo)
 
-        # Werkzeuge (checkbar, Tastenkuerzel S/P/L/R/M)
+        # --- Werkzeuge (checkbar) ---------------------------------------------------
         m_tools = menu.addMenu("&Werkzeuge")
         group = QActionGroup(self)
         self.tool_actions: dict[str, QAction] = {}
-        for name, label, key in (
-                ("select", "Auswahl", "S"),
-                ("point", "Punkt", "P"),
-                ("polyline", "Polylinie", "L"),
-                ("trace", "Linie abgreifen", "T"),
-                ("region", "Flaeche aufnehmen", "F"),
-                ("refpoint", "Referenzpunkt", "R"),
-                ("measure", "Massstab pruefen", "M")):
-            act = QAction(label, self, checkable=True)
+        for name, label, key, tip in (
+                ("select", "Auswahl", "S",
+                 "Objekte waehlen und loeschen"),
+                ("point", "Punkt", "P", "Einzelnen Punkt setzen"),
+                ("polyline", "Polylinie", "L",
+                 "Polylinie zeichnen (Enter fertig, C geschlossen)"),
+                ("arc", "Bogen", "B",
+                 "Kreisbogen: Start, Ende, Punkt auf dem Bogen"),
+                ("trace", "Abgreifen", "T",
+                 "Vorhandene Plan-Linie oder -Bogen per Klick uebernehmen"),
+                ("region", "Flaeche", "F",
+                 "Gefuellte PDF-Flaeche per Klick als Polygon aufnehmen"),
+                ("fill", "Fuellen", "K",
+                 "Von eigenen Linien umschlossene Flaeche zum Polygon "
+                 "machen (wie Fuellen in Paint)"),
+                ("merge", "Verbinden", "V",
+                 "Lose Enden zusammenfuehren (rot markiert); Enter = alle "
+                 "nahen automatisch"),
+                ("refpoint", "Referenz", "R",
+                 "Referenzpunkt der aktiven Ansicht setzen"),
+                ("measure", "Messen", "M",
+                 "Massstab per 2-Punkt-Messung pruefen")):
+            act = QAction(make_icon(name), label, self, checkable=True)
             act.setShortcut(QKeySequence(key))
+            act.setToolTip(f"{tip} ({key})")
             act.triggered.connect(lambda _=False, n=name: self.set_tool(n))
             group.addAction(act)
             m_tools.addAction(act)
-            toolbar.addAction(act)
             self.tool_actions[name] = act
         self.tool_actions["select"].setChecked(True)
+
         m_tools.addSeparator()
-        self.act_plan_snap = QAction("Plan-Snap (Linien/Schnittpunkte)", self,
+        self.act_plan_snap = QAction(make_icon("plansnap"), "Plan-Snap", self,
                                      checkable=True, checked=True)
         self.act_plan_snap.setShortcut(QKeySequence("G"))
+        self.act_plan_snap.setToolTip(
+            "Auf Linien/Schnittpunkte des Plans fangen (G)")
         self.act_plan_snap.toggled.connect(self._toggle_plan_snap)
+        self.act_magnifier = QAction(make_icon("magnifier"), "Lupe", self,
+                                     checkable=True)
+        self.act_magnifier.setShortcut(QKeySequence("A"))
+        self.act_magnifier.setToolTip(
+            "Lupe am Cursor ein-/ausblenden (A)")
+        self.act_magnifier.toggled.connect(
+            lambda on: self.magnifier.set_active(on))
         m_tools.addAction(self.act_plan_snap)
-        toolbar.addSeparator()
-        toolbar.addAction(self.act_plan_snap)
-        toolbar.addAction(self.act_undo)
-        toolbar.addAction(self.act_redo)
+        m_tools.addAction(self.act_magnifier)
 
+        # --- Ansichten -----------------------------------------------------------
         m_view = menu.addMenu("&Ansichten")
         self.act_add_view = QAction("Neue Ansicht...", self)
         self.act_add_view.triggered.connect(self.add_view)
@@ -147,21 +177,52 @@ class MainWindow(QMainWindow):
         self.act_edit_view.triggered.connect(self.edit_view)
         self.act_del_view = QAction("Aktive Ansicht loeschen", self)
         self.act_del_view.triggered.connect(self.delete_view)
-        self.act_fit = QAction("Seite einpassen", self)
+        self.act_fit = QAction(make_icon("fit"), "Einpassen", self)
         self.act_fit.setShortcut(QKeySequence("Ctrl+0"))
+        self.act_fit.setToolTip("Seite einpassen (Strg+0)")
         self.act_fit.triggered.connect(self.canvas.fit_page)
         for a in (self.act_add_view, self.act_edit_view,
                   self.act_del_view, self.act_fit):
             m_view.addAction(a)
 
+        # --- RFEM -----------------------------------------------------------------
         m_rfem = menu.addMenu("&RFEM")
-        self.act_rfem_test = QAction("Verbindung testen", self)
+        self.act_rfem_test = QAction(make_icon("connect"),
+                                     "Verbindung testen", self)
         self.act_rfem_test.triggered.connect(self.test_rfem)
-        self.act_rfem_transfer = QAction("Nach RFEM uebertragen...", self)
+        self.act_rfem_transfer = QAction(make_icon("transfer"),
+                                         "Uebertragen", self)
         self.act_rfem_transfer.setShortcut(QKeySequence("F5"))
+        self.act_rfem_transfer.setToolTip(
+            "Geometrie nach RFEM uebertragen (F5)")
         self.act_rfem_transfer.triggered.connect(self.transfer_to_rfem)
         m_rfem.addAction(self.act_rfem_test)
         m_rfem.addAction(self.act_rfem_transfer)
+
+        # --- Toolbar: gruppiert von links nach rechts ------------------------------
+        # Datei | Zeichnen | Abgreifen | Einrichten | Anzeige | Verlauf | RFEM
+        toolbar = self.addToolBar("Werkzeuge")
+        toolbar.setMovable(False)
+        toolbar.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
+        toolbar.setIconSize(QSize(26, 26))
+        toolbar.addAction(self.act_open_pdf)
+        toolbar.addAction(self.act_save)
+        toolbar.addSeparator()
+        for n in ("select", "point", "polyline", "arc"):
+            toolbar.addAction(self.tool_actions[n])
+        toolbar.addSeparator()
+        for n in ("trace", "region", "fill", "merge"):
+            toolbar.addAction(self.tool_actions[n])
+        toolbar.addSeparator()
+        for n in ("refpoint", "measure"):
+            toolbar.addAction(self.tool_actions[n])
+        toolbar.addSeparator()
+        toolbar.addAction(self.act_plan_snap)
+        toolbar.addAction(self.act_magnifier)
+        toolbar.addAction(self.act_fit)
+        toolbar.addSeparator()
+        toolbar.addAction(self.act_undo)
+        toolbar.addAction(self.act_redo)
         toolbar.addSeparator()
         toolbar.addAction(self.act_rfem_transfer)
 
@@ -468,6 +529,7 @@ class MainWindow(QMainWindow):
         self._refresh_object_table()
         self._update_view_label()
         self.canvas.rebuild_objects(self.project, self.selection)
+        self.controller.active.on_refresh()
 
     def _update_title(self) -> None:
         title = "PDF2RFEM"
@@ -558,6 +620,31 @@ class MainWindow(QMainWindow):
                 rows.append((l.id, kind, view.name if view else "?",
                              f"{len(l.point_ids)} Punkte",
                              self.project.rfem_line_map.get(l.id)))
+            from ..core.faces import surface_area
+            for s in model.surfaces.values():
+                view = self.project.views.get(s.view_id)
+                tf = view.transform() if view else None
+                area = surface_area(model, s)
+                if tf is not None and area is not None:
+                    info = f"A = {area * tf.m_per_pt ** 2:.3f} m²"
+                    if s.opening_ids:
+                        info += f", {len(s.opening_ids)} Aussparung(en)"
+                else:
+                    info = f"{len(s.boundary_ids)} Randobjekte"
+                rows.append((s.id, "Flaeche", view.name if view else "?",
+                             info, self.project.rfem_surface_map.get(s.id)))
+            from ..core.arcs import circle_from_3_points
+            for a in model.arcs.values():
+                view = self.project.views.get(a.view_id)
+                tf = view.transform() if view else None
+                info = "Bogen"
+                if tf is not None:
+                    s, e = (model.points[pid].pos for pid in a.point_ids)
+                    fit = circle_from_3_points(s, a.control, e)
+                    if fit is not None:
+                        info = f"R = {tf.pdf_dist_to_meters(fit[1]):.3f} m"
+                rows.append((a.id, "Bogen", view.name if view else "?", info,
+                             self.project.rfem_line_map.get(a.id)))
             self.obj_table.setRowCount(len(rows))
             for r, (oid, typ, vname, info, no) in enumerate(rows):
                 for c, text in enumerate(
